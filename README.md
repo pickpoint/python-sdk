@@ -219,6 +219,22 @@ PICKPOINT_API_KEY=… pytest tests/test_e2e_geocode_batch.py -q --tb=short
 # optional: PICKPOINT_BASE_URL=https://api.pickpoint.io  (default: https://beta-api.pickpoint.io)
 ```
 
+### CI & release
+
+- **PR** → `.github/workflows/ci.yml` (pytest on Python 3.10 / 3.12 / 3.13)
+- **Push to `main`** (untagged HEAD) → bump **patch**, tag `vX.Y.Z`, PyPI publish (OIDC) + GitHub Release in the same job  
+  (tag push via `GITHUB_TOKEN` does not start new workflows — publish cannot wait on the tag event)
+- **Manual tag `v*`** (pushed by a human) → publish + GitHub Release
+
+Minor/major: bump `version` in `pyproject.toml` and `__version__` in a PR, merge with `[skip release]` in the commit message, then:
+
+```bash
+git tag v2.1.0
+git push origin v2.1.0
+```
+
+PyPI Trusted Publishing must match this workflow: repo `python-sdk`, workflow `release.yml`, environment `pypi`.
+
 Protobuf stubs under `src/pickpoint/tracking/v2` are generated from [`pickpoint-proto`](https://github.com/pickpoint/pickpoint-proto). Regenerate:
 
 ```bash

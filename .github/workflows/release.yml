@@ -1,0 +1,176 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # Auto-patch on main when HEAD is not already tagged.
+  # NOTE: pushes made with GITHUB_TOKEN do not trigger new workflows, so we
+  # must publish in this same job (cannot rely on the tag push event).
+  release-main:
+    if: github.ref == "refs/heads/main"
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if release commit or already tagged
+        id: guard
+        run: |
+          msg=$(git log -1 --pretty=%B)
+          if echo "$msg" | grep -q '\[skip release\]'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: commit has [skip release]"
+            exit 0
+          fi
+          if git describe --exact-match --tags HEAD 2>/dev/null | grep -q '^v'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: HEAD already tagged"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          python-version: "3.13"
+
+      - if: steps.guard.outputs.skip != 'true'
+        run: pip install -e ".[dev]" build
+
+      - if: steps.guard.outputs.skip != 'true'
+        run: pytest -q
+
+      - name: Bump patch, commit, tag
+        if: steps.guard.outputs.skip != 'true'
+        id: bump
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          ver=$(python <<'PY'
+          from pathlib import Path
+          import re
+
+          pp = Path("pyproject.toml")
+          text = pp.read_text()
+          m = re.search(r'^version = "(\d+)\.(\d+)\.(\d+)"', text, re.M)
+          if not m:
+              raise SystemExit("version not found in pyproject.toml")
+          major, minor, patch = map(int, m.groups())
+          new = f"{major}.{minor}.{patch + 1}"
+          text = re.sub(
+              r'^version = "\d+\.\d+\.\d+"',
+              f'version = "{new}"',
+              text,
+              count=1,
+              flags=re.M,
+          )
+          pp.write_text(text)
+          init = Path("src/pickpoint/__init__.py")
+          init.write_text(
+              re.sub(
+                  r'__version__ = "[^"]+"',
+                  f'__version__ = "{new}"',
+                  init.read_text(),
+                  count=1,
+              )
+          )
+          print(new)
+          PY
+          )
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          git add pyproject.toml src/pickpoint/__init__.py
+          git commit -m "chore: release v${ver} [skip release]"
+          git tag "v${ver}"
+          git push origin HEAD:main --follow-tags
+
+      - name: Build
+        if: steps.guard.outputs.skip != 'true'
+        run: python -m build
+
+      - name: Publish to PyPI (OIDC)
+        if: steps.guard.outputs.skip != 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: GitHub Release
+        if: steps.guard.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.bump.outputs.version }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Manual tags (human push). GITHUB_TOKEN tag pushes from release-main do not
+  # reach here — that path publishes above.
+  publish-tag:
+    if: startsWith(github.ref, "refs/tags/v")
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify tag matches package version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$tag" != "$ver" ]; then
+            echo "Tag v$tag != pyproject.toml version $ver"
+            exit 1
+          fi
+          init_ver=$(python -c "import re; t=open('src/pickpoint/__init__.py').read(); print(re.search(r'__version__ = \"([^\"]+)\"', t).group(1))")
+          if [ "$tag" != "$init_ver" ]; then
+            echo "Tag v$tag != __version__ $init_ver"
+            exit 1
+          fi
+
+      - run: pip install -e ".[dev]" build
+      - run: pytest -q
+      - run: python -m build
+
+      - name: Skip if version already on PyPI
+        id: exists
+        run: |
+          ver=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if curl -sf "https://pypi.org/pypi/pickpoint/${ver}/json" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Version $ver already published — skip PyPI publish"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to PyPI (OIDC)
+        if: steps.exists.outputs.exists != 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
