@@ -55,4 +55,4 @@ __all__ = [
     "mint_client_tokens",
 ]
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
