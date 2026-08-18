@@ -1,4 +1,4 @@
-"""Realtime tracking client (binary WebSocket by default, gRPC supported)."""
+"""Realtime tracking client (binary WebSocket, tracking.v2)."""
 
 from __future__ import annotations
 
@@ -7,35 +7,43 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any
 
-import grpc
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed
 
 from .backoff import new_backoff, next_delay, reset_backoff
-from .codec import clone_lat_lng, decode_server_msg, encode_client_msg, stamp_lat_lng, stamp_lat_lngs
-from .errors import Error, error_from_wire, is_auth_error, is_fatal_resume_error, new_error
-from .queue import OfflineQueue
+from .codec import (
+    clone_lat_lng,
+    decode_server_msg,
+    encode_client_msg,
+    encode_inflight_frames,
+    stamp_lat_lng,
+    strip_live_time,
+)
+from .errors import Error, error_from_wire, is_auth_error, is_fatal_resume_error, is_retry_resume_error, new_error
+from .filter import NoiseFilter
+from .queue import OfflineQueue, QueuedPoint
 from .rate import can_accept_publish, next_publish_allowed_at
-from .types import Config, ConnectionState, DeviceAuth, ListenerAuth, Transport
-from .url import build_ws_url
-from .v2 import (
+from .types import (
+    MAX_IN_FLIGHT_FRAMES,
+    PROTOCOL_VERSION,
+    SUBPROTOCOL,
     ClientMsg,
     Command,
     CommandAck,
-    Event,
+    Config,
+    ConnectionState,
     ErrorCode,
+    Event,
     LatLng,
-    LocationAdd,
-    LocationBatch,
     Resume,
     ServerMsg,
     Subscribe,
     TrackStart,
     TrackStop,
-    TrackingStub,
+    Unsubscribe,
 )
+from .url import build_ws_url
 
-SUBPROTOCOL = "tracking.v2.proto"
 MAX_PUBLISH_HZ = 50
 MIN_PUBLISH_INTERVAL = 1.0 / MAX_PUBLISH_HZ
 MAX_EVENT_BYTES = 4 * 1024
@@ -61,6 +69,7 @@ class Client:
             refresh_auth=cfg.refresh_auth,
             max_queue_size=cfg.max_queue_size or 10_000,
             hello_timeout=hello,
+            subscribe=list(cfg.subscribe or []),
         )
         self._lock = asyncio.Lock()
         self._state = ConnectionState.CONNECTING
@@ -68,6 +77,8 @@ class Client:
         self._client_seq = 0
         self._last_acked_seq = 0
         self._queue = OfflineQueue(self.cfg.max_queue_size)
+        self._filter = NoiseFilter()
+        self._unacked_frames = 0
         self._backoff = new_backoff(
             self.cfg.reconnect_min_delay,
             self.cfg.reconnect_max_delay,
@@ -75,13 +86,16 @@ class Client:
         )
         self._next_publish_at = 0.0
         self._next_event_at = 0.0
-        self._subscriptions: set[str] = set()
+        self._subscriptions: dict[str, dict[str, Any]] = {
+            uid: {"include_events": True, "min_interval": 0, "handle": 0}
+            for uid in (cfg.subscribe or [])
+            if uid
+        }
+        self._sub_by_handle: dict[int, str] = {}
         self._intentional = False
         self._dial_gen = 0
         self._ws: Any | None = None
-        self._grpc_channel: grpc.aio.Channel | None = None
-        self._grpc_call: Any | None = None
-        self._send_q: asyncio.Queue[ClientMsg | None] | None = None
+        self._send_q: asyncio.Queue[bytes | None] | None = None
         self._writer_task: asyncio.Task[None] | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
@@ -90,9 +104,10 @@ class Client:
         self._start_fut: asyncio.Future[str] | None = None
         self._stop_fut: asyncio.Future[None] | None = None
         self._resume_fut: asyncio.Future[int] | None = None
+        self._starting = False
 
     @property
-    def state(self) -> ConnectionState:
+    def state(self) -> ConnectionState | str:
         return self._state
 
     @property
@@ -107,7 +122,7 @@ class Client:
     def last_acked_seq(self) -> int:
         return self._last_acked_seq
 
-    async def _set_state(self, s: ConnectionState) -> None:
+    async def _set_state(self, s: ConnectionState | str) -> None:
         self._state = s
 
     async def dial(self, *, send_resume: bool = False) -> None:
@@ -120,17 +135,18 @@ class Client:
             else:
                 await self._set_state(ConnectionState.CONNECTING)
             cfg = self.cfg
+            self._unacked_frames = 0
 
         url = build_ws_url(cfg)
         ws = await ws_connect(url, subprotocols=[SUBPROTOCOL], open_timeout=cfg.hello_timeout)
         if ws.subprotocol != SUBPROTOCOL:
             await ws.close()
-            raise Error(ErrorCode.ERROR_CODE_INVALID, f"server did not accept {SUBPROTOCOL}")
+            raise Error(ErrorCode.INVALID, f"server did not accept {SUBPROTOCOL}")
 
         async with self._lock:
             if gen != self._dial_gen or self._intentional:
                 await ws.close()
-                raise Error(ErrorCode.ERROR_CODE_INVALID, "dial superseded")
+                raise Error(ErrorCode.INVALID, "dial superseded")
             await self._close_transport_locked()
             self._ws = ws
             self._send_q = asyncio.Queue()
@@ -140,27 +156,32 @@ class Client:
             raw = await asyncio.wait_for(ws.recv(), timeout=cfg.hello_timeout)
         except TimeoutError as e:
             await ws.close()
-            raise Error(ErrorCode.ERROR_CODE_INVALID, "hello timeout") from e
+            raise Error(ErrorCode.INVALID, "hello timeout") from e
         if isinstance(raw, str):
             await ws.close()
-            raise Error(ErrorCode.ERROR_CODE_INVALID, "expected binary hello")
+            raise Error(ErrorCode.INVALID, "expected binary hello")
         msg = decode_server_msg(raw)
-        kind = msg.WhichOneof("body")
-        if kind == "relocate":
+        if msg is None:
+            await ws.close()
+            raise Error(ErrorCode.INVALID, "expected hello")
+        if msg.relocate is not None:
             await ws.close()
             await self._handle_relocate(msg.relocate, send_resume=send_resume)
             return
-        if kind == "error":
+        if msg.error is not None:
             await ws.close()
             raise error_from_wire(msg.error)
-        if kind != "hello":
+        if msg.hello is None:
             await ws.close()
-            raise Error(ErrorCode.ERROR_CODE_INVALID, f"expected hello, got {kind}")
+            raise Error(ErrorCode.INVALID, f"expected hello, got {msg.kind()}")
+        if msg.hello.version != PROTOCOL_VERSION:
+            await ws.close()
+            raise Error(ErrorCode.INVALID, f"unsupported protocol version {msg.hello.version}")
 
         async with self._lock:
             if gen != self._dial_gen or self._intentional:
                 await ws.close()
-                raise Error(ErrorCode.ERROR_CODE_INVALID, "dial superseded")
+                raise Error(ErrorCode.INVALID, "dial superseded")
             await self._set_state(ConnectionState.OPEN)
             reset_backoff(self._backoff)
             self._reader_task = asyncio.create_task(self._read_loop_ws(ws, gen))
@@ -169,42 +190,13 @@ class Client:
             await self._send_resume_and_wait()
         await self._resubscribe()
 
-    async def _connect_grpc(self) -> None:
-        target = self.cfg.endpoint
-        channel = grpc.aio.insecure_channel(target)
-        md: list[tuple[str, str]] = []
-        if self.cfg.device is not None:
-            md.append(("x-client-id", self.cfg.device.client_id))
-            md.append(("x-client-secret", self.cfg.device.client_secret))
-        elif self.cfg.listener is not None:
-            md.append(("authorization", f"Bearer {self.cfg.listener.access_token}"))
-        stub = TrackingStub(channel)
-        call = stub.Session(metadata=md)
-        async with self._lock:
-            self._grpc_channel = channel
-            self._grpc_call = call
-            self._send_q = asyncio.Queue()
-            self._writer_task = asyncio.create_task(self._write_loop_grpc(call, self._send_q))
-            self._reader_task = asyncio.create_task(self._read_loop_grpc(call))
-            await self._set_state(ConnectionState.OPEN)
-
-    async def _write_loop_ws(self, ws: Any, q: asyncio.Queue[ClientMsg | None]) -> None:
+    async def _write_loop_ws(self, ws: Any, q: asyncio.Queue[bytes | None]) -> None:
         try:
             while True:
-                msg = await q.get()
-                if msg is None:
+                data = await q.get()
+                if data is None:
                     break
-                await ws.send(encode_client_msg(msg))
-        except Exception:
-            pass
-
-    async def _write_loop_grpc(self, call: Any, q: asyncio.Queue[ClientMsg | None]) -> None:
-        try:
-            while True:
-                msg = await q.get()
-                if msg is None:
-                    break
-                await call.write(msg)
+                await ws.send(data)
         except Exception:
             pass
 
@@ -217,76 +209,76 @@ class Client:
                     msg = decode_server_msg(raw)
                 except Exception:
                     continue
+                if msg is None:
+                    continue
                 await self._dispatch(msg)
         except ConnectionClosed:
             pass
         finally:
             await self._on_socket_closed(gen)
 
-    async def _read_loop_grpc(self, call: Any) -> None:
-        try:
-            async for msg in call:
-                await self._dispatch(msg)
-        except Exception:
-            pass
-
     async def _dispatch(self, msg: ServerMsg) -> None:
-        kind = msg.WhichOneof("body")
-        if kind == "relocate":
+        if msg.relocate is not None:
             asyncio.create_task(self._handle_relocate(msg.relocate, send_resume=True))
             return
-        if kind == "resume_ok":
+        if msg.resume_ok is not None:
             async with self._lock:
                 if msg.resume_ok.track_uid:
                     self._track_uid = msg.resume_ok.track_uid
-                self._last_acked_seq = msg.resume_ok.last_acked_seq
+                self._last_acked_seq = msg.resume_ok.last_acked
                 if self._client_seq < self._last_acked_seq:
                     self._client_seq = self._last_acked_seq
                 self._queue.ack_through(self._last_acked_seq)
+                self._unacked_frames = 0
                 fut = self._resume_fut
                 self._resume_fut = None
-            await self._flush_queue()
+            await self._resend_inflight()
+            await self._flush_staging()
             if fut is not None and not fut.done():
-                fut.set_result(msg.resume_ok.last_acked_seq)
+                fut.set_result(msg.resume_ok.last_acked)
             await self._push_recv(msg)
             return
-        if kind == "track_started":
+        if msg.track_started is not None:
             async with self._lock:
                 self._track_uid = msg.track_started.track_uid
                 self._client_seq = 0
                 self._last_acked_seq = 0
-                self._queue.clear()
+                self._unacked_frames = 0
+                self._starting = False
                 fut = self._start_fut
                 self._start_fut = None
             if fut is not None and not fut.done():
                 fut.set_result(msg.track_started.track_uid)
+            await self._flush_staging()
             await self._push_recv(msg)
             return
-        if kind == "track_stopped":
+        if msg.track_stopped is not None:
             async with self._lock:
-                if self._track_uid == msg.track_stopped.track_uid:
+                if self._track_uid == msg.track_stopped.track_uid or not msg.track_stopped.track_uid:
                     self._track_uid = ""
                     self._queue.clear()
+                    self._filter.reset()
                 fut = self._stop_fut
                 self._stop_fut = None
             if fut is not None and not fut.done():
                 fut.set_result(None)
             await self._push_recv(msg)
             return
-        if kind == "location_added":
+        if msg.ack is not None:
             async with self._lock:
-                if msg.location_added.client_seq > self._last_acked_seq:
-                    self._last_acked_seq = msg.location_added.client_seq
-                self._queue.ack_through(msg.location_added.client_seq)
-            await self._push_recv(msg)
+                if msg.ack.seq > self._last_acked_seq:
+                    self._last_acked_seq = msg.ack.seq
+                self._queue.ack_through(msg.ack.seq)
+                self._unacked_frames = 0
+            await self._flush_staging()
             return
-        if kind == "command":
+        if msg.command is not None:
             try:
                 self._cmd_q.put_nowait(msg.command)
             except asyncio.QueueFull:
                 pass
             return
-        if kind == "error":
+        if msg.error is not None:
             err = error_from_wire(msg.error)
             async with self._lock:
                 if self._resume_fut is not None:
@@ -295,11 +287,18 @@ class Client:
                     if is_fatal_resume_error(err.code):
                         self._track_uid = ""
                         self._queue.clear()
+                        self._filter.reset()
+                        self._client_seq = 0
+                        self._last_acked_seq = 0
                     if not fut.done():
-                        fut.set_exception(err)
+                        if is_retry_resume_error(err.code):
+                            fut.set_exception(err)
+                        else:
+                            fut.set_exception(err)
                 elif self._start_fut is not None:
                     fut = self._start_fut
                     self._start_fut = None
+                    self._starting = False
                     if not fut.done():
                         fut.set_exception(err)
                 elif self._stop_fut is not None:
@@ -307,8 +306,20 @@ class Client:
                     self._stop_fut = None
                     if not fut.done():
                         fut.set_exception(err)
+                elif err.code == ErrorCode.TRACK_NOT_FOUND:
+                    self._track_uid = ""
+                    self._queue.clear()
+                    self._filter.reset()
             if is_auth_error(err.code):
                 asyncio.create_task(self._handle_auth_error())
+            await self._push_recv(msg)
+            return
+        if msg.subscribed is not None:
+            async with self._lock:
+                opts = self._subscriptions.get(msg.subscribed.device_uid)
+                if opts is not None:
+                    opts["handle"] = msg.subscribed.sub
+                    self._sub_by_handle[msg.subscribed.sub] = msg.subscribed.device_uid
             await self._push_recv(msg)
             return
         await self._push_recv(msg)
@@ -331,7 +342,7 @@ class Client:
                 send_resume = True
             intentional = self._intentional
         if intentional:
-            raise Error(ErrorCode.ERROR_CODE_INVALID, "closed")
+            raise Error(ErrorCode.INVALID, "closed")
         await self.dial(send_resume=send_resume)
 
     async def _handle_auth_error(self) -> None:
@@ -377,12 +388,14 @@ class Client:
                 return
             self._ws = None
             self._send_q = None
+            self._unacked_frames = 0
+            self._queue.mark_unsent()
             if self._intentional:
                 await self._set_state(ConnectionState.CLOSED)
                 return
-            if self.cfg.disable_reconnect or self.cfg.transport == Transport.GRPC:
+            if self.cfg.disable_reconnect:
                 await self._set_state(ConnectionState.CLOSED)
-                self._reject_pending_locked(Error(ErrorCode.ERROR_CODE_INVALID, "connection closed"))
+                self._reject_pending_locked(Error(ErrorCode.INVALID, "connection closed"))
                 return
             await self._schedule_reconnect_locked()
 
@@ -391,9 +404,7 @@ class Client:
         delay = next_delay(self._backoff)
         if delay is None:
             await self._set_state(ConnectionState.CLOSED)
-            self._reject_pending_locked(
-                Error(ErrorCode.ERROR_CODE_INVALID, "reconnect attempts exhausted")
-            )
+            self._reject_pending_locked(Error(ErrorCode.INVALID, "reconnect attempts exhausted"))
             return
         send_resume = bool(self._track_uid)
         await self._clear_reconnect_locked()
@@ -416,6 +427,7 @@ class Client:
         self._reconnect_task = asyncio.create_task(_run())
 
     def _reject_pending_locked(self, err: Exception) -> None:
+        self._starting = False
         for attr in ("_start_fut", "_stop_fut", "_resume_fut"):
             fut = getattr(self, attr)
             if fut is not None and not fut.done():
@@ -445,23 +457,22 @@ class Client:
             except Exception:
                 pass
             self._ws = None
-        if self._grpc_call is not None:
-            try:
-                await self._grpc_call.done_writing()
-            except Exception:
-                pass
-            self._grpc_call = None
-        if self._grpc_channel is not None:
-            await self._grpc_channel.close()
-            self._grpc_channel = None
         self._send_q = None
 
     async def _resubscribe(self) -> None:
         async with self._lock:
-            subs = list(self._subscriptions)
-        for d in subs:
-            msg = ClientMsg()
-            msg.subscribe.CopyFrom(Subscribe(device_uid=d))
+            items = [(uid, dict(opts)) for uid, opts in self._subscriptions.items()]
+            self._sub_by_handle.clear()
+            for opts in self._subscriptions.values():
+                opts["handle"] = 0
+        for uid, opts in items:
+            msg = ClientMsg(
+                subscribe=Subscribe(
+                    device_uid=uid,
+                    include_events=bool(opts.get("include_events", True)),
+                    min_interval_ms=int(opts.get("min_interval", 0)),
+                )
+            )
             try:
                 await self.send(msg)
             except Exception:
@@ -476,33 +487,67 @@ class Client:
             loop = asyncio.get_running_loop()
             fut: asyncio.Future[int] = loop.create_future()
             self._resume_fut = fut
-        msg = ClientMsg()
-        msg.resume.CopyFrom(Resume(track_uid=uid, last_client_seq=seq))
+        msg = ClientMsg(resume=Resume(track_uid=uid, last_seq=seq))
         try:
             await self.send(msg)
         except Exception:
             async with self._lock:
                 self._resume_fut = None
             raise
-        await fut
+        try:
+            await fut
+        except Error as err:
+            if is_retry_resume_error(err.code):
+                delay = (err.retry_after_ms / 1000.0) if err.retry_after_ms else 0.05
+                await asyncio.sleep(delay)
+                await self._send_resume_and_wait()
+                return
+            raise
 
-    async def _flush_queue(self) -> None:
+    async def _send_raw(self, data: bytes) -> None:
+        async with self._lock:
+            q = self._send_q
+            if q is None:
+                raise Error(ErrorCode.INVALID, "socket not open")
+            await q.put(data)
+
+    async def _resend_inflight(self) -> None:
         async with self._lock:
             uid = self._track_uid
-            pending = self._queue.peek_all()
             open_ = self._state == ConnectionState.OPEN and self._send_q is not None
-        if not uid or not open_ or not pending:
+            pts = [(p.seq, p.point) for p in self._queue.peek_all()]
+        if not uid or not open_ or not pts:
             return
-        points = [p.point for p in pending]
-        last = pending[-1].seq
-        msg = ClientMsg()
-        batch = LocationBatch(track_uid=uid, client_seq=last)
-        batch.points.extend(stamp_lat_lngs([clone_lat_lng(p) for p in points if p is not None]))  # type: ignore[misc]
-        msg.location_batch.CopyFrom(batch)
-        try:
-            await self.send(msg)
-        except Exception:
-            pass
+        frames = encode_inflight_frames(pts)
+        async with self._lock:
+            self._unacked_frames += len(frames)
+        for f in frames:
+            try:
+                await self._send_raw(f)
+            except Exception:
+                break
+
+    async def _flush_staging(self) -> None:
+        async with self._lock:
+            uid = self._track_uid
+            open_ = self._state == ConnectionState.OPEN and self._send_q is not None
+            window = MAX_IN_FLIGHT_FRAMES - self._unacked_frames
+            if not uid or not open_ or window <= 0:
+                return
+            assigned = self._queue.assign_from_staging(window * 100, self._client_seq)
+            if assigned:
+                self._client_seq = assigned[-1].seq
+            q = self._send_q
+        if not assigned or q is None:
+            return
+        frames = encode_inflight_frames([(p.seq, p.point) for p in assigned])
+        async with self._lock:
+            self._unacked_frames += len(frames)
+        for f in frames:
+            try:
+                await q.put(f)
+            except Exception:
+                break
 
     async def recv(self) -> ServerMsg:
         return await self._recv_q.get()
@@ -517,27 +562,20 @@ class Client:
     async def recv_command(self) -> Command:
         return await self._cmd_q.get()
 
-    async def ack_command(
-        self,
-        command_id: str,
-        status: int,
-        message: str = "",
-    ) -> None:
-        ack = CommandAck(command_id=command_id, status=status)
-        if message:
-            ack.message = message
-        msg = ClientMsg()
-        msg.command_ack.CopyFrom(ack)
-        await self.send(msg)
+    async def ack_command(self, command_id: str, status: int, message: str = "") -> None:
+        await self.send(
+            ClientMsg(command_ack=CommandAck(command_id=command_id, status=status, message=message))
+        )
 
     async def send(self, msg: ClientMsg) -> None:
+        data = encode_client_msg(msg)
         async with self._lock:
             if self._state == ConnectionState.CLOSED and self._intentional:
-                raise Error(ErrorCode.ERROR_CODE_INVALID, "closed")
+                raise Error(ErrorCode.INVALID, "closed")
             q = self._send_q
             if q is None:
-                raise Error(ErrorCode.ERROR_CODE_INVALID, "socket not open")
-            await q.put(msg)
+                raise Error(ErrorCode.INVALID, "socket not open")
+            await q.put(data)
 
     async def start_track(
         self,
@@ -548,21 +586,23 @@ class Client:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[str] = loop.create_future()
         async with self._lock:
+            self._queue.clear()
+            self._filter.reset()
+            self._client_seq = 0
+            self._last_acked_seq = 0
+            self._starting = True
             self._start_fut = fut
-        start = TrackStart()
-        if loc is not None:
-            start.location.CopyFrom(stamp_lat_lng(clone_lat_lng(loc)) or LatLng())
-        if route:
-            start.route.extend(stamp_lat_lngs([clone_lat_lng(p) for p in route if p]))  # type: ignore[misc]
-        if metadata:
-            start.metadata = metadata
-        msg = ClientMsg()
-        msg.track_start.CopyFrom(start)
+        start = TrackStart(
+            location=clone_lat_lng(loc),
+            route=[clone_lat_lng(p) for p in (route or []) if p],  # type: ignore[misc]
+            metadata=metadata or b"",
+        )
         try:
-            await self.send(msg)
+            await self.send(ClientMsg(track_start=start))
         except Exception:
             async with self._lock:
                 self._start_fut = None
+                self._starting = False
             raise
         return await fut
 
@@ -573,10 +613,8 @@ class Client:
             self._track_uid = track_uid
             self._client_seq = last_client_seq
             self._resume_fut = fut
-        msg = ClientMsg()
-        msg.resume.CopyFrom(Resume(track_uid=track_uid, last_client_seq=last_client_seq))
         try:
-            await self.send(msg)
+            await self.send(ClientMsg(resume=Resume(track_uid=track_uid, last_seq=last_client_seq)))
         except Exception:
             async with self._lock:
                 self._resume_fut = None
@@ -584,25 +622,55 @@ class Client:
         return await fut
 
     async def publish(self, point: LatLng) -> tuple[int, bool]:
+        start_loc: LatLng | None = None
         async with self._lock:
-            if not self._track_uid:
+            if not self._track_uid and not self._starting:
+                self._starting = True
+                self._queue.clear()
+                self._filter.reset()
+                self._client_seq = 0
+                self._last_acked_seq = 0
+                self._filter.seed(clone_lat_lng(point))
+                start_loc = clone_lat_lng(point)
+        if start_loc is not None:
+            try:
+                await self.send(ClientMsg(track_start=TrackStart(location=start_loc)))
+            except Exception:
+                async with self._lock:
+                    self._starting = False
                 return 0, False
+            return 0, True
+        async with self._lock:
             now = time.monotonic()
+            emitted = self._filter.push(point)
+            if emitted is None:
+                return self._client_seq, False
+            open_ = (
+                self._state == ConnectionState.OPEN
+                and self._send_q is not None
+                and bool(self._track_uid)
+            )
+            window_ok = self._unacked_frames < MAX_IN_FLIGHT_FRAMES
+            if not open_ or not window_ok:
+                stamp_lat_lng(emitted)
+                self._queue.push_staging(emitted)
+                return self._client_seq, True
             if not can_accept_publish(self._next_publish_at, now, 1):
                 return self._client_seq, False
             self._next_publish_at = next_publish_allowed_at(self._next_publish_at, now, 1)
             self._client_seq += 1
             seq = self._client_seq
-            uid = self._track_uid
-            pt = stamp_lat_lng(clone_lat_lng(point))
-            assert pt is not None
-            self._queue.enqueue(seq, pt)
-            open_ = self._state == ConnectionState.OPEN and self._send_q is not None
-        if open_:
-            msg = ClientMsg()
-            msg.location_add.CopyFrom(LocationAdd(track_uid=uid, client_seq=seq, point=pt))
+            live = strip_live_time(emitted)
+            self._queue.push_inflight_unsent(seq, emitted)
+            q = self._send_q
+        if q is not None:
             try:
-                await self.send(msg)
+                frames = encode_inflight_frames([(seq, live)])
+                async with self._lock:
+                    self._unacked_frames += len(frames)
+                    self._queue.record_frame(seq)
+                for f in frames:
+                    await q.put(f)
             except Exception:
                 pass
         return seq, True
@@ -610,15 +678,13 @@ class Client:
     async def stop_track(self, track_uid: str | None = None) -> None:
         uid = track_uid or self._track_uid
         if not uid:
-            raise new_error(ErrorCode.ERROR_CODE_INVALID, "no active track")
+            raise new_error(ErrorCode.INVALID, "no active track")
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[None] = loop.create_future()
         async with self._lock:
             self._stop_fut = fut
-        msg = ClientMsg()
-        msg.track_stop.CopyFrom(TrackStop(track_uid=uid))
         try:
-            await self.send(msg)
+            await self.send(ClientMsg(track_stop=TrackStop()))
         except Exception:
             async with self._lock:
                 self._stop_fut = None
@@ -627,11 +693,11 @@ class Client:
 
     async def send_event(self, payload: bytes) -> bool:
         if len(payload) > MAX_EVENT_BYTES:
-            raise new_error(ErrorCode.ERROR_CODE_INVALID, "event payload exceeds 4 KiB")
+            raise new_error(ErrorCode.INVALID, "event payload exceeds 4 KiB")
         async with self._lock:
             uid = self._track_uid
             if not uid:
-                raise new_error(ErrorCode.ERROR_CODE_INVALID, "startTrack() before sendEvent()")
+                raise new_error(ErrorCode.INVALID, "startTrack() before sendEvent()")
             now = time.monotonic()
             if self._next_event_at and now < self._next_event_at:
                 return False
@@ -639,37 +705,61 @@ class Client:
             open_ = self._state == ConnectionState.OPEN and self._send_q is not None
         if not open_:
             return True
-        ev = Event(track_uid=uid, payload=payload)
-        ev.timestamp_ms = int(time.time() * 1000)
-        msg = ClientMsg()
-        msg.event.CopyFrom(ev)
-        await self.send(msg)
+        await self.send(
+            ClientMsg(event=Event(payload=payload, timestamp_ms=int(time.time() * 1000)))
+        )
         return True
 
-    async def subscribe(self, device_uid: str) -> None:
+    async def subscribe(
+        self,
+        device_uid: str,
+        *,
+        include_events: bool = True,
+        min_interval_ms: int = 0,
+    ) -> None:
         async with self._lock:
-            self._subscriptions.add(device_uid)
-        msg = ClientMsg()
-        msg.subscribe.CopyFrom(Subscribe(device_uid=device_uid))
-        await self.send(msg)
+            self._subscriptions[device_uid] = {
+                "include_events": include_events,
+                "min_interval": min_interval_ms,
+                "handle": 0,
+            }
+        await self.send(
+            ClientMsg(
+                subscribe=Subscribe(
+                    device_uid=device_uid,
+                    include_events=include_events,
+                    min_interval_ms=min_interval_ms,
+                )
+            )
+        )
+
+    async def unsubscribe(self, sub: int) -> None:
+        async with self._lock:
+            uid = self._sub_by_handle.pop(int(sub), None)
+            if uid is not None:
+                self._subscriptions.pop(uid, None)
+        await self.send(ClientMsg(unsubscribe=Unsubscribe(sub=int(sub))))
 
     async def close(self) -> None:
+        uid = self._track_uid
+        if uid:
+            try:
+                await self.send(ClientMsg(track_stop=TrackStop()))
+            except Exception:
+                pass
         async with self._lock:
             self._intentional = True
             await self._clear_reconnect_locked()
             await self._set_state(ConnectionState.CLOSED)
-            self._reject_pending_locked(new_error(ErrorCode.ERROR_CODE_INVALID, "client closed"))
+            self._reject_pending_locked(new_error(ErrorCode.INVALID, "client closed"))
             await self._close_transport_locked()
 
 
 async def connect(cfg: Config) -> Client:
     if not cfg.endpoint:
-        raise Error(ErrorCode.ERROR_CODE_INVALID, "Endpoint is required")
+        raise Error(ErrorCode.INVALID, "Endpoint is required")
     if cfg.device is None and cfg.listener is None:
-        raise Error(ErrorCode.ERROR_CODE_INVALID, "Device or Listener auth is required")
+        raise Error(ErrorCode.INVALID, "Device or Listener auth is required")
     client = Client(cfg)
-    if cfg.transport == Transport.GRPC:
-        await client._connect_grpc()
-        return client
     await client.dial(send_resume=False)
     return client

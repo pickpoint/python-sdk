@@ -7,7 +7,7 @@ Official Python SDK for [Pickpoint](https://pickpoint.io) — a geolocation plat
 | **Geocoding** | Address ↔ coordinates (forward, reverse, place lookup) |
 | **Address search** | Typeahead / autocomplete for address inputs |
 | **Routing** | Routes, matrices, optimized multi-stop, elevation |
-| **Device tracking** | Register devices over HTTP; stream live GPS over WebSocket / gRPC |
+| **Device tracking** | Register devices over HTTP; stream live GPS over WebSocket |
 
 Built for maps, delivery, logistics, and anything that needs places, routes, or live location. Data is OpenStreetMap-backed; HTTP responses are plain JSON / GeoJSON. Docs: [pickpoint.io/docs](https://pickpoint.io/docs).
 
@@ -16,8 +16,7 @@ Built for maps, delivery, logistics, and anything that needs places, routes, or 
 | Module | Import | Role |
 |--------|--------|------|
 | root | `pickpoint` | HTTP: geocode, search, routing, devices, client-tokens |
-| [`tracking`](#tracking) | `pickpoint.tracking` | Realtime tracks (WebSocket by default, gRPC supported) |
-| `tracking.v2` | `pickpoint.tracking.v2` | Generated protobuf (`tracking.v2`) |
+| [`tracking`](#tracking) | `pickpoint.tracking` | Live GPS over WebSocket (`tracking.v2`) |
 
 Apache-2.0. Go sibling: [`github.com/pickpoint/go-sdk`](https://github.com/pickpoint/go-sdk). Rust sibling: [`github.com/pickpoint/rust-sdk`](https://github.com/pickpoint/rust-sdk). JS sibling: [`@pickpoint/sdk`](https://github.com/pickpoint/pickpoint-js). Wire schema: [`pickpoint-proto`](https://github.com/pickpoint/pickpoint-proto).
 
@@ -26,13 +25,6 @@ pip install pickpoint
 ```
 
 Requires Python **3.10+**.
-
-```
-python-sdk/
-  src/pickpoint/           # HTTP client
-  src/pickpoint/tracking/  # tracking session client
-  src/pickpoint/tracking/v2/  # protobuf stubs
-```
 
 ---
 
@@ -146,60 +138,59 @@ Config(
 
 ## Tracking
 
-Realtime publisher / listener over **binary WebSocket** (`tracking.v2.proto` subprotocol). **gRPC** via `Transport.GRPC`.
+Live GPS is a **separate** WebSocket session: `wss://tracking.pickpoint.io/v2/ws`, subprotocol `tracking.v2`. It is not the HTTP `Client`.
+
+A dropped socket is not a new trip. The SDK reconnects and **Resumes** the same `track_uid`.
+
+First `publish` starts the trip if none is live. `close` sends `TrackStop` then hangs up. Call `start_track` only to supersede (new order / `TRACK_NOT_FOUND`) or to set a route.
+
+### Device (publisher)
 
 ```python
 import asyncio
-from pickpoint import tracking
-from pickpoint.tracking.v2 import LatLng
+from pickpoint.tracking import Config, DeviceAuth, LatLng, connect
 
 async def main() -> None:
-    client = await tracking.connect(
-        tracking.Config(
-            endpoint="wss://tracking.pickpoint.io",  # local: "ws://127.0.0.1:3100"
-            device=tracking.DeviceAuth(
-                client_id=device_uid,
-                client_secret=device_secret,
-            ),
+    session = await connect(
+        Config(
+            endpoint="wss://tracking.pickpoint.io",  # host; SDK appends /v2/ws
+            device=DeviceAuth(client_id=device_uid, client_secret=device_secret),
         )
     )
-    try:
-        track_uid = await client.start_track(
-            LatLng(latitude=55.75, longitude=37.61)
-        )
-        seq, ok = await client.publish(LatLng(latitude=55.76, longitude=37.62))
-        # managed client_seq; ok=False if rate-limited locally
-        await client.stop_track()
-    finally:
-        await client.close()
+    await session.publish(LatLng(latitude=55.75, longitude=37.61))  # TrackStart if idle
+    await session.close()  # TrackStop + hang up
 
 asyncio.run(main())
 ```
 
-### Auth modes
+### Listener (dashboard)
 
-| Config | Role |
-|--------|------|
-| `device=DeviceAuth(…)` | Publisher (device) |
-| `listener=ListenerAuth(…)` | Dashboard / subscriber JWT |
+The JWT is the **client-token** `access_token` — same one as HTTP `client_auth`. Mint it on your backend with scope `devices`.
 
-Exactly one of `device` / `listener` is required.
+```python
+import os
+from pickpoint import Config, mint_client_tokens
+from pickpoint.tracking import Config as TrackingConfig, ListenerAuth, connect
 
-### Main methods
+pair = await mint_client_tokens(
+    Config(api_key=os.environ["PICKPOINT_API_KEY"]),
+    scopes=["devices"],
+    ttl_sec=600,
+)
+session = await connect(
+    TrackingConfig(
+        endpoint="wss://tracking.pickpoint.io",
+        listener=ListenerAuth(access_token=pair.access_token),
+        subscribe=[device_uid],
+    )
+)
+while True:
+    msg = await session.recv()
+    if msg.loc:  # live fan-out; publisher never sees Loc
+        print(msg.loc.point.latitude, msg.loc.point.longitude)
+```
 
-| Method | Purpose |
-|--------|---------|
-| `start_track` | Open a track; returns `track_uid` |
-| `publish` | Point on active track (managed `client_seq`); capped at **50 Hz** |
-| `resume` | Manual resume; auto-reconnect also resumes |
-| `stop_track` | End track |
-| `send_event` | Opaque event ≤4 KiB; capped at **1 Hz** |
-| `subscribe` | Listener: subscribe to a device UID |
-| `recv` | Next `ServerMsg` |
-| `recv_command` / `ack_command` | Inbound commands |
-| `close` | Tear down session |
-
-Limits enforced client-side: `MAX_PUBLISH_HZ = 50`, `MAX_EVENT_BYTES = 4 KiB`, `MAX_EVENT_HZ = 1`.
+Wire format: [`pickpoint-proto`](https://github.com/pickpoint/pickpoint-proto).
 
 ---
 
@@ -234,14 +225,3 @@ git push origin v2.1.0
 ```
 
 PyPI Trusted Publishing must match this workflow: repo `python-sdk`, workflow `release.yml`, environment `pypi`.
-
-Protobuf stubs under `src/pickpoint/tracking/v2` are generated from [`pickpoint-proto`](https://github.com/pickpoint/pickpoint-proto). Regenerate:
-
-```bash
-python -m grpc_tools.protoc \
-  -I ../pickpoint-proto \
-  --python_out=src/pickpoint/tracking/v2 \
-  --grpc_python_out=src/pickpoint/tracking/v2 \
-  ../pickpoint-proto/tracking/v2/*.proto
-# then flatten nested tracking/v2/ paths and fix imports to `from . import …_pb2`
-```

@@ -8,18 +8,25 @@ from websockets.asyncio.server import serve
 from websockets.server import ServerConnection
 
 from pickpoint.tracking import SUBPROTOCOL
-from pickpoint.tracking.v2 import (
+from pickpoint.tracking.codec import decode_client_msg, encode_server_msg
+from pickpoint.tracking.types import (
+    PROTOCOL_VERSION,
+    Ack,
     ClientMsg,
-    Error,
+    ErrorCode,
     Hello,
-    LocationAdded,
     Relocate,
     ResumeOk,
     ServerMsg,
     Subscribed,
     TrackStarted,
     TrackStopped,
+    WireError,
 )
+
+MOCK_TRACK_UID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+MOCK_DEVICE_UID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+MOCK_NODE_ID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 
 
 @dataclass
@@ -29,7 +36,7 @@ class MockConn:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def send(self, msg: ServerMsg) -> None:
-        await self.ws.send(msg.SerializeToString())
+        await self.ws.send(encode_server_msg(msg))
 
     async def close(self) -> None:
         await self.ws.close()
@@ -50,7 +57,7 @@ class MockServer:
         self.opts = MockOpts()
         self._lock = asyncio.Lock()
         self._server = None
-        self._task: asyncio.Task[None] | None = None
+        self._next_sub = 1
 
     @property
     def conn_count(self) -> int:
@@ -80,13 +87,6 @@ class MockServer:
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
-        if self._task is not None:
-            self._task.cancel()
-
-
-def process_request(connection: ServerConnection, request):  # type: ignore[no-untyped-def]
-    """Accept tracking.v2.proto subprotocol."""
-    return None
 
 
 async def start_mock(
@@ -114,73 +114,51 @@ async def start_mock(
             ms.opts.before_hello(idx, c)
 
         if ms.opts.relocate_on_connect is not None and idx == 1:
-            msg = ServerMsg()
-            msg.relocate.CopyFrom(ms.opts.relocate_on_connect)
-            await c.send(msg)
+            await c.send(ServerMsg(relocate=ms.opts.relocate_on_connect))
         else:
-            msg = ServerMsg()
-            msg.hello.CopyFrom(Hello(node_id="mock-1"))
-            await c.send(msg)
+            await c.send(
+                ServerMsg(hello=Hello(version=PROTOCOL_VERSION, node_id=MOCK_NODE_ID))
+            )
 
         try:
             async for raw in ws:
                 if isinstance(raw, str):
                     continue
-                msg = ClientMsg()
-                msg.ParseFromString(raw)
+                try:
+                    msg = decode_client_msg(raw)
+                except Exception:
+                    continue
                 async with c._lock:
-                    clone = ClientMsg()
-                    clone.CopyFrom(msg)
-                    c.messages.append(clone)
+                    c.messages.append(msg)
                 if ms.opts.on_msg is not None:
                     ms.opts.on_msg(msg, c)
                 if not ms.opts.auto:
                     continue
-                kind = msg.WhichOneof("body")
-                if kind == "track_start":
-                    out = ServerMsg()
-                    out.track_started.CopyFrom(TrackStarted(track_uid="track-mock-1"))
-                    await c.send(out)
-                elif kind == "track_stop":
-                    out = ServerMsg()
-                    out.track_stopped.CopyFrom(TrackStopped(track_uid=msg.track_stop.track_uid))
-                    await c.send(out)
-                elif kind == "resume":
-                    out = ServerMsg()
-                    out.resume_ok.CopyFrom(
-                        ResumeOk(track_uid=msg.resume.track_uid, last_acked_seq=0)
-                    )
-                    await c.send(out)
-                elif kind == "location_add":
-                    out = ServerMsg()
-                    la = LocationAdded(
-                        track_uid=msg.location_add.track_uid,
-                        client_seq=msg.location_add.client_seq,
-                        device_uid="dev-1",
-                    )
-                    la.point.CopyFrom(msg.location_add.point)
-                    out.location_added.CopyFrom(la)
-                    await c.send(out)
-                elif kind == "location_batch":
-                    out = ServerMsg()
-                    out.location_added.CopyFrom(
-                        LocationAdded(
-                            track_uid=msg.location_batch.track_uid,
-                            client_seq=msg.location_batch.client_seq,
-                            device_uid="dev-1",
+                if msg.track_start is not None:
+                    await c.send(ServerMsg(track_started=TrackStarted(track_uid=MOCK_TRACK_UID)))
+                elif msg.track_stop is not None:
+                    await c.send(ServerMsg(track_stopped=TrackStopped(track_uid=MOCK_TRACK_UID)))
+                elif msg.resume is not None:
+                    await c.send(
+                        ServerMsg(
+                            resume_ok=ResumeOk(track_uid=msg.resume.track_uid, last_acked=0)
                         )
                     )
-                    await c.send(out)
-                elif kind == "subscribe":
-                    out = ServerMsg()
-                    out.subscribed.CopyFrom(
-                        Subscribed(device_uid=msg.subscribe.device_uid, track_uid="track-mock-1")
+                elif msg.loc is not None:
+                    await c.send(ServerMsg(ack=Ack(seq=msg.loc.seq)))
+                elif msg.subscribe is not None:
+                    sub = ms._next_sub
+                    ms._next_sub += 1
+                    await c.send(
+                        ServerMsg(
+                            subscribed=Subscribed(
+                                sub=sub,
+                                device_uid=msg.subscribe.device_uid,
+                                track_uid=MOCK_TRACK_UID,
+                                online=True,
+                            )
+                        )
                     )
-                    await c.send(out)
-                elif kind == "ping":
-                    out = ServerMsg()
-                    out.pong.SetInParent()
-                    await c.send(out)
         except Exception:
             pass
 
@@ -189,7 +167,6 @@ async def start_mock(
         "127.0.0.1",
         0,
         subprotocols=[SUBPROTOCOL],
-        process_request=process_request,
     )
     ms._server = server
     sock = server.sockets[0]
@@ -199,9 +176,7 @@ async def start_mock(
 
 
 def server_error(code: int, message: str) -> ServerMsg:
-    msg = ServerMsg()
-    msg.error.CopyFrom(Error(code=code, message=message))
-    return msg
+    return ServerMsg(error=WireError(code=code, message=message))
 
 
 async def wait_for(pred: Callable[[], bool], timeout: float = 5.0) -> None:

@@ -19,7 +19,7 @@ def build_ws_url(cfg: Config) -> str:
         scheme = "wss"
     elif scheme not in ("ws", "wss"):
         raise ValueError(f"tracking: unsupported scheme {scheme!r}")
-    path = cfg.ws_path or "/v2/tracking/ws"
+    path = cfg.ws_path or "/v2/ws"
     q: dict[str, str] = {}
     if cfg.device is not None:
         q["client-id"] = cfg.device.client_id

@@ -5,9 +5,16 @@ import asyncio
 import pytest
 
 from pickpoint import tracking
-from pickpoint.tracking.v2 import ErrorCode, LatLng, LocationAdded, ServerMsg
+from pickpoint.tracking.types import ErrorCode, LatLng, ServerLoc, ServerMsg
 
-from common.tracking_mock import MockConn, server_error, start_mock, wait_for
+from common.tracking_mock import (
+    MOCK_DEVICE_UID,
+    MOCK_TRACK_UID,
+    MockConn,
+    server_error,
+    start_mock,
+    wait_for,
+)
 
 
 @pytest.mark.asyncio
@@ -79,16 +86,10 @@ async def test_resume_after_publish() -> None:
             uid = await c.start_track(LatLng(latitude=1, longitude=1))
             ok = (await c.publish(LatLng(latitude=2, longitude=2)))[1]
             assert ok
-            deadline = asyncio.get_event_loop().time() + 2
-            while asyncio.get_event_loop().time() < deadline:
-                msg = await asyncio.wait_for(c.recv(), timeout=2)
-                if msg.WhichOneof("body") == "location_added":
-                    break
-            else:
-                pytest.fail("no location_added")
+            await ms.wait_msg(lambda m: m.loc is not None, 2.0)
             acked = await c.resume(uid, 1)
             assert acked == 0
-            await ms.wait_msg(lambda m: m.WhichOneof("body") == "resume", 2.0)
+            await ms.wait_msg(lambda m: m.resume is not None, 2.0)
         finally:
             await c.close()
     finally:
@@ -98,19 +99,19 @@ async def test_resume_after_publish() -> None:
 @pytest.mark.asyncio
 async def test_listener_subscribe_and_location() -> None:
     def on_msg(msg, conn: MockConn) -> None:
-        if msg.WhichOneof("body") == "subscribe":
+        if msg.subscribe is not None:
 
             async def _send() -> None:
                 await asyncio.sleep(0.02)
-                out = ServerMsg()
-                la = LocationAdded(
-                    device_uid=msg.subscribe.device_uid,
-                    track_uid="t1",
-                    client_seq=3,
+                await conn.send(
+                    ServerMsg(
+                        loc=ServerLoc(
+                            sub=1,
+                            seq=3,
+                            point=LatLng(latitude=1.5, longitude=2.5),
+                        )
+                    )
                 )
-                la.point.CopyFrom(LatLng(latitude=1.5, longitude=2.5))
-                out.location_added.CopyFrom(la)
-                await conn.send(out)
 
             asyncio.create_task(_send())
 
@@ -124,15 +125,14 @@ async def test_listener_subscribe_and_location() -> None:
             )
         )
         try:
-            await c.subscribe("device-1")
+            await c.subscribe(MOCK_DEVICE_UID)
             deadline = asyncio.get_event_loop().time() + 3
             while asyncio.get_event_loop().time() < deadline:
                 msg = await asyncio.wait_for(c.recv(), timeout=3)
-                kind = msg.WhichOneof("body")
-                if kind == "location_added":
-                    assert msg.location_added.point.latitude == 1.5
+                if msg.loc is not None:
+                    assert msg.loc.point.latitude == 1.5
                     return
-                if kind == "subscribed":
+                if msg.subscribed is not None:
                     continue
             pytest.fail("no location")
         finally:
@@ -161,13 +161,14 @@ async def test_reconnect_sends_resume() -> None:
             assert c.client_seq == 2
             first = await ms.wait_conn(2.0)
             await first.close()
-            resume = await ms.wait_msg(lambda m: m.WhichOneof("body") == "resume", 8.0)
+            resume = await ms.wait_msg(lambda m: m.resume is not None, 8.0)
+            assert resume.resume is not None
             assert resume.resume.track_uid == uid
-            assert resume.resume.last_client_seq == 2
+            assert resume.resume.last_seq == 2
             starts = 0
             for conn in ms.connections:
                 for m in conn.messages:
-                    if m.WhichOneof("body") == "track_start":
+                    if m.track_start is not None:
                         starts += 1
             assert starts == 1
             await wait_for(lambda: c.state == tracking.ConnectionState.OPEN, 5.0)
@@ -180,15 +181,13 @@ async def test_reconnect_sends_resume() -> None:
 @pytest.mark.asyncio
 async def test_reconnect_track_not_found_clears_cursor() -> None:
     def on_msg(msg, conn: MockConn) -> None:
-        kind = msg.WhichOneof("body")
-
         async def _reply() -> None:
-            if kind == "track_start":
-                out = ServerMsg()
-                out.track_started.track_uid = "t-gone"
-                await conn.send(out)
-            elif kind == "resume":
-                await conn.send(server_error(ErrorCode.ERROR_CODE_TRACK_NOT_FOUND, "track expired"))
+            if msg.track_start is not None:
+                from pickpoint.tracking.types import TrackStarted
+
+                await conn.send(ServerMsg(track_started=TrackStarted(track_uid=MOCK_TRACK_UID)))
+            elif msg.resume is not None:
+                await conn.send(server_error(ErrorCode.TRACK_NOT_FOUND, "track expired"))
 
         asyncio.create_task(_reply())
 
@@ -204,10 +203,10 @@ async def test_reconnect_track_not_found_clears_cursor() -> None:
         )
         try:
             await c.start_track()
-            assert c.track_uid == "t-gone"
+            assert c.track_uid == MOCK_TRACK_UID
             conn = await ms.wait_conn(2.0)
             await conn.close()
-            await ms.wait_msg(lambda m: m.WhichOneof("body") == "resume", 8.0)
+            await ms.wait_msg(lambda m: m.resume is not None, 8.0)
             await wait_for(lambda: c.track_uid == "", 5.0)
         finally:
             await c.close()
